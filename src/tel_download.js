@@ -75,7 +75,7 @@
     RETRY_BASE_DELAY: 1000,       // [개선 3] 첫 재시도 대기 시간 (ms). 이후 2배씩 증가 (1s → 2s → 4s)
     SELECT_MODE_DELAY: 2000,      // [개선 2] 선택 다운로드 시 항목 간 대기 시간 (ms)
     MEDIA_VIEWER_TIMEOUT: 8000,   // [개선 2] 미리보기 열림 대기 최대 시간 (ms)
-    DEBUG: false,                 // true로 하면 콘솔 로그가 더 자세해짐
+    DEBUG: true,                  // 문제 진단용 — 잘 되면 false로 바꾸세요
   };
 
   // ==========================================================================
@@ -649,7 +649,8 @@
     },
 
     // 미리보기가 열리고 원본 미디어 URL이 준비될 때까지 폴링
-    waitForMediaViewer(timeoutMs) {
+    // excludeUrl: 이 URL은 무시 (이전 항목의 잔여 URL을 새 URL로 잘못 인식하는 것 방지)
+    waitForMediaViewer(timeoutMs, excludeUrl = null) {
       const isWebK = location.pathname.startsWith("/k/");
       const startTime = Date.now();
 
@@ -663,26 +664,20 @@
             if (container) {
               const aspecter = container.querySelector(SELECTORS.webk.mediaAspecter);
               if (aspecter) {
-                // 비디오 우선
                 const video = aspecter.querySelector("video");
                 if (video && video.src && !video.src.startsWith("blob:undefined")) {
                   mediaUrl = video.src;
                   mediaType = "video";
                 } else {
                   const img = aspecter.querySelector("img.thumbnail");
-                  if (img && img.src) {
-                    // 썸네일이 아직 저화질일 수 있으므로, 좀 더 기다림
-                    // img 가 thumbnail이 아니라 실제 원본인지 확인하기 위해 자연 사이즈 체크
-                    if (img.naturalWidth > 100) {
-                      mediaUrl = img.src;
-                      mediaType = "image";
-                    }
+                  if (img && img.src && img.naturalWidth > 100) {
+                    mediaUrl = img.src;
+                    mediaType = "image";
                   }
                 }
               }
             }
           } else {
-            // WebZ
             const container = document.querySelector(SELECTORS.webz.mediaContainer);
             if (container) {
               const videoPlayer = container.querySelector(SELECTORS.webz.videoPlayer);
@@ -702,6 +697,11 @@
             }
           }
 
+          // 이전 URL과 같으면 아직 새 미디어 안 떴음 → 계속 대기
+          if (mediaUrl && excludeUrl && mediaUrl === excludeUrl) {
+            mediaUrl = null;
+          }
+
           if (mediaUrl) {
             resolve({ url: mediaUrl, type: mediaType });
             return;
@@ -713,6 +713,44 @@
           }
 
           setTimeout(check, 200);
+        };
+        check();
+      });
+    },
+
+    // 미리보기가 닫힐 때까지 대기 (최대 timeoutMs)
+    waitForMediaViewerClosed(timeoutMs = 3000) {
+      const isWebK = location.pathname.startsWith("/k/");
+      const startTime = Date.now();
+
+      return new Promise((resolve) => {
+        const check = () => {
+          const container = isWebK
+            ? document.querySelector(SELECTORS.webk.mediaContainer)
+            : document.querySelector(SELECTORS.webz.mediaContainer);
+
+          // 컨테이너가 없거나, 있어도 비어있으면 닫힌 것으로 간주
+          let isClosed = !container;
+          if (!isClosed && container) {
+            const aspecter = isWebK
+              ? container.querySelector(SELECTORS.webk.mediaAspecter)
+              : container.querySelector(".MediaViewerContent");
+            if (!aspecter || (!aspecter.querySelector("video") && !aspecter.querySelector("img"))) {
+              isClosed = true;
+            }
+          }
+
+          if (isClosed) {
+            resolve(true);
+            return;
+          }
+
+          if (Date.now() - startTime > timeoutMs) {
+            resolve(false); // 타임아웃이어도 reject하지 않고 진행
+            return;
+          }
+
+          setTimeout(check, 100);
         };
         check();
       });
@@ -765,6 +803,12 @@
 
       let success = 0;
       let failed = 0;
+      let lastMediaUrl = null; // 직전 항목의 URL (잔여 감지 방지)
+
+      // 시작 전 미리보기가 열려있다면 닫고 시작
+      this.closeMediaViewer();
+      await sleep(500);
+      await this.waitForMediaViewerClosed(2000);
 
       for (let i = 0; i < items.length; i++) {
         const [mediaId, info] = items[i];
@@ -772,12 +816,19 @@
         logger.info(`[${i + 1}/${total}] 다운로드 시도: ${mediaId}`);
 
         try {
+          // 0) clickTarget이 여전히 DOM에 있는지 확인
+          if (!document.body.contains(info.clickTarget)) {
+            throw new Error("clickTarget이 DOM에서 사라졌어요. 채팅을 스크롤하지 마세요.");
+          }
+
           // 1) 미디어 클릭해서 미리보기 열기
           info.clickTarget.click();
+          logger.debug(`[${i + 1}/${total}] click 완료, 미리보기 대기 중...`);
 
-          // 2) 원본 로드될 때까지 대기
-          const media = await this.waitForMediaViewer(CONFIG.MEDIA_VIEWER_TIMEOUT);
+          // 2) 원본 로드될 때까지 대기 (이전 URL은 무시)
+          const media = await this.waitForMediaViewer(CONFIG.MEDIA_VIEWER_TIMEOUT, lastMediaUrl);
           logger.info(`[${i + 1}/${total}] 원본 캐치: ${media.type} - ${media.url.substring(0, 80)}...`);
+          lastMediaUrl = media.url;
 
           // 3) 다운로드 함수 호출
           if (media.type === "video") {
@@ -787,14 +838,19 @@
           }
           success++;
 
-          // 4) 미리보기 닫기 (다운로드는 백그라운드에서 계속됨)
-          await sleep(300);
+          // 4) 미리보기 닫기 + 완전히 닫힐 때까지 대기
+          await sleep(500);
           this.closeMediaViewer();
+          await this.waitForMediaViewerClosed(3000);
+          logger.debug(`[${i + 1}/${total}] 미리보기 닫힘 확인`);
         } catch (err) {
           logger.error(`[${i + 1}/${total}] 실패: ${err.message}`);
           failed++;
-          // 실패해도 미리보기는 닫고 다음으로
+          // 실패 시에도 미리보기 강제로 닫고 충분히 대기
           this.closeMediaViewer();
+          await sleep(500);
+          this.closeMediaViewer(); // 한 번 더 시도
+          await this.waitForMediaViewerClosed(3000);
         }
 
         // 5) 다음 항목 전 대기
