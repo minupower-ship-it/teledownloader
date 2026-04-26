@@ -522,17 +522,40 @@
       }
     },
 
-    // 메시지 버블에서 "클릭하면 미리보기가 열리는" 미디어 요소 찾기
-    findClickTarget(bubble) {
+    // 메시지 버블에서 클릭 가능한 미디어 요소들을 모두 찾기
+    // ⚠️ 앨범(여러 미디어가 묶인 메시지)의 경우 여러 개를 반환해야 함
+    findClickTargets(bubble) {
       const isWebK = location.pathname.startsWith("/k/");
+      const targets = [];
 
       if (isWebK) {
-        // WebK: .attachment 안의 .media-photo 또는 .media-video 클릭하면 미리보기 열림
-        return bubble.querySelector(".attachment .media-photo, .attachment .media-video, .attachment img, .attachment video, .media-photo, .media-video");
+        // WebK 앨범: .bubble > .grouped-item (각 미디어가 하나의 grouped-item)
+        // WebK 단일: .bubble > .attachment > .media-photo / .media-video
+        const groupedItems = bubble.querySelectorAll(".grouped-item");
+        if (groupedItems.length > 0) {
+          // 앨범 케이스: 각 grouped-item이 클릭 대상
+          groupedItems.forEach((item) => targets.push(item));
+        } else {
+          // 단일 미디어 케이스
+          const single = bubble.querySelector(
+            ".attachment .media-photo, .attachment .media-video, .attachment img, .attachment video, .media-photo, .media-video"
+          );
+          if (single) targets.push(single);
+        }
       } else {
-        // WebZ: .media-inner 또는 그 안의 이미지/비디오
-        return bubble.querySelector(".media-inner img, .media-inner video, .media-inner");
+        // WebZ 앨범: .Message > .album-wrapper > .album-item-select-wrapper (각 항목)
+        // WebZ 단일: .Message > .media-inner
+        const albumItems = bubble.querySelectorAll(".album-item-select-wrapper, .album-item, .Album__item");
+        if (albumItems.length > 0) {
+          albumItems.forEach((item) => targets.push(item));
+        } else {
+          const single = bubble.querySelector(".media-inner img, .media-inner video, .media-inner");
+          if (single) targets.push(single);
+        }
       }
+
+      // 아바타/프로필 사진 제외
+      return targets.filter((t) => !t.closest(".avatar, .ProfilePhoto, .user-avatar, .peer-avatar"));
     },
 
     attachCheckboxes() {
@@ -540,71 +563,68 @@
       const bubbles = document.querySelectorAll(isWebK ? ".bubble" : ".Message");
 
       bubbles.forEach((bubble) => {
-        if (bubble.querySelector(".tel-select-checkbox")) return;
+        // 클릭 가능한 모든 미디어 요소 찾기 (앨범이면 여러 개)
+        const clickTargets = this.findClickTargets(bubble);
+        if (clickTargets.length === 0) return;
 
-        // 클릭 가능한 미디어가 있는지 확인
-        const clickTarget = this.findClickTarget(bubble);
-        if (!clickTarget) return;
+        const bubbleId = bubble.getAttribute("data-mid") ||
+                         bubble.getAttribute("data-message-id") ||
+                         bubble.id ||
+                         "msg_" + Math.random().toString(36).substring(2, 10);
 
-        // 아바타나 프로필 사진은 제외
-        if (clickTarget.closest(".avatar, .ProfilePhoto, .user-avatar, .peer-avatar")) return;
+        clickTargets.forEach((clickTarget, index) => {
+          // 이 미디어 요소에 이미 체크박스가 붙어있는지 확인
+          if (clickTarget.querySelector(":scope > .tel-select-checkbox")) return;
 
-        const messageId = bubble.getAttribute("data-mid") ||
-                          bubble.getAttribute("data-message-id") ||
-                          bubble.id ||
-                          "msg_" + Math.random().toString(36).substring(2, 10);
+          // 미디어별 고유 ID = 버블ID + 인덱스
+          const mediaId = `${bubbleId}_${index}`;
 
-        const checkbox = document.createElement("div");
-        checkbox.className = "tel-select-checkbox";
-        checkbox.style.cssText = `
-          position: absolute;
-          top: 8px;
-          left: 8px;
-          width: 28px;
-          height: 28px;
-          border: 2px solid white;
-          border-radius: 50%;
-          background-color: rgba(0,0,0,0.5);
-          cursor: pointer;
-          z-index: 100;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 16px;
-          color: white;
-          font-weight: bold;
-          box-shadow: 0 0 6px rgba(0,0,0,0.6);
-          user-select: none;
-        `;
-        checkbox.dataset.messageId = messageId;
+          const checkbox = document.createElement("div");
+          checkbox.className = "tel-select-checkbox";
+          checkbox.style.cssText = `
+            position: absolute;
+            top: 8px;
+            left: 8px;
+            width: 28px;
+            height: 28px;
+            border: 2px solid white;
+            border-radius: 50%;
+            background-color: rgba(0,0,0,0.5);
+            cursor: pointer;
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            color: white;
+            font-weight: bold;
+            box-shadow: 0 0 6px rgba(0,0,0,0.6);
+            user-select: none;
+          `;
+          checkbox.dataset.mediaId = mediaId;
 
-        checkbox.onclick = (e) => {
-          e.stopPropagation();
-          e.preventDefault();
-          this.toggleSelection(messageId, bubble, checkbox);
-        };
+          checkbox.onclick = (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            this.toggleSelection(mediaId, clickTarget, checkbox);
+          };
 
-        // position:relative 적용
-        const targetParent = clickTarget.closest(".attachment, .media-container, .media-inner") || bubble;
-        if (getComputedStyle(targetParent).position === "static") {
-          targetParent.style.position = "relative";
-        }
-        targetParent.appendChild(checkbox);
+          // clickTarget이 absolute 기준점이 되도록
+          if (getComputedStyle(clickTarget).position === "static") {
+            clickTarget.style.position = "relative";
+          }
+          clickTarget.appendChild(checkbox);
+        });
       });
     },
 
-    toggleSelection(messageId, bubble, checkbox) {
-      if (this.selected.has(messageId)) {
-        this.selected.delete(messageId);
+    toggleSelection(mediaId, clickTarget, checkbox) {
+      if (this.selected.has(mediaId)) {
+        this.selected.delete(mediaId);
         checkbox.style.backgroundColor = "rgba(0,0,0,0.5)";
         checkbox.innerText = "";
       } else {
-        const clickTarget = this.findClickTarget(bubble);
-        if (!clickTarget) {
-          alert("이 메시지에서 다운로드 가능한 미디어를 찾지 못했어요.");
-          return;
-        }
-        this.selected.set(messageId, { bubble, clickTarget });
+        this.selected.set(mediaId, { clickTarget });
         checkbox.style.backgroundColor = "#5288c1";
         checkbox.innerText = "✓";
       }
@@ -747,9 +767,9 @@
       let failed = 0;
 
       for (let i = 0; i < items.length; i++) {
-        const [messageId, info] = items[i];
+        const [mediaId, info] = items[i];
         this.updateRunningStatus(i + 1, total);
-        logger.info(`[${i + 1}/${total}] 다운로드 시도: ${messageId}`);
+        logger.info(`[${i + 1}/${total}] 다운로드 시도: ${mediaId}`);
 
         try {
           // 1) 미디어 클릭해서 미리보기 열기
